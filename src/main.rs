@@ -52,14 +52,16 @@ fn div_rem<T: std::ops::Div<Output = T> + std::ops::Rem<Output = T> + Copy>(x: T
 impl<'a> Context<'a> {
     fn new(rom_path: &'a Path, model: &'a Path) -> Result<Context<'a>, Error> {
         if !model.is_dir() {
-            eprintln!("Unable to open {}.", model.display());
-            exit(1);
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("Unable to open {}.", model.display()),
+            ));
         }
         if !rom_path.is_file() {
-            Error::new(
+            return Err(Error::new(
                 ErrorKind::NotFound,
                 format!("Unable to open {}.", rom_path.display()),
-            );
+            ));
         }
 
         let length = fs::metadata(&rom_path)?.len();
@@ -122,7 +124,7 @@ impl<'a> Context<'a> {
         file.seek(SeekFrom::Start(0))?;
         while length > 0 {
             /* Prep */
-            let [l, h] = (*section_id).to_le_bytes();
+            let [l, h] = section_id.to_le_bytes();
             let mut flash_page: u16 = u16::from(h);
             let mut index: u8 = l;
             let mut nSID: u16 = 0xFFFF;
@@ -177,16 +179,16 @@ impl<'a> Context<'a> {
         paths.sort_by_key(|dir| dir.path());
         for entry in paths {
             let path = entry.path();
+            let entry_name: OsString = entry.file_name();
+            let entry_str: &str = entry_name.to_str().unwrap();
+            let entry_name_bytes: &[u8] = entry_str.as_bytes();
             if entry.file_type()?.is_symlink() {
-                let target = path.read_link().expect("Failed to follow symlink");
+                let target = path.read_link()?;
                 println!(
                     "Adding link from {} to {}...",
                     path.display(),
                     target.display()
                 );
-
-                let entry_name: OsString = entry.file_name();
-                let entry_name_bytes: &[u8] = entry_name.to_str().unwrap().as_bytes();
 
                 // Use .to_str() instead of .file_name() to avoid
                 // losing relative path.
@@ -194,7 +196,7 @@ impl<'a> Context<'a> {
                 let target_name: &str = target.to_str().unwrap();
                 let target_name_bytes: &[u8] = target_name.as_bytes();
 
-                let dl: u16 = entry_name.len().try_into().unwrap();
+                let dl: u16 = entry_name_bytes.len().try_into().unwrap();
                 let tl: u16 = target_name_bytes.len().try_into().unwrap();
 
                 let elen: u16 = dl + tl + 5;
@@ -210,9 +212,6 @@ impl<'a> Context<'a> {
                 sentry.reverse();
                 self.write_fat(sentry, elen + 3, fatptr)?
             } else if path.is_dir() {
-                let entry_name: OsString = entry.file_name();
-                let entry_str = entry_name.to_str().unwrap();
-                let entry_name_bytes: &[u8] = entry_str.as_bytes();
                 let elen: u16 = (entry_name.len() + 6).try_into().map_err(|_| {
                     Error::new(
                         ErrorKind::InvalidData,
@@ -226,16 +225,13 @@ impl<'a> Context<'a> {
                 fentry[1..=2].clone_from_slice(&elen.to_le_bytes());
                 fentry[3..=4].clone_from_slice(&parent.to_le_bytes());
                 *parent_id += 1;
-                fentry[5..=6].clone_from_slice(&(*parent_id).to_le_bytes());
+                fentry[5..=6].clone_from_slice(&parent_id.to_le_bytes());
                 fentry[7] = 0xFF; // Flags
                 fentry[8..][..entry.file_name().len()].clone_from_slice(entry_name_bytes);
                 fentry.reverse();
                 self.write_fat(fentry, elen + 3, fatptr)?;
                 self.write_recursive(path, parent_id, section_id, fatptr)?
             } else if path.is_file() {
-                let entry_name: OsString = entry.file_name();
-                let entry_str = entry_name.to_str().unwrap();
-                let entry_name_bytes: &[u8] = entry_str.as_bytes();
                 let elen: u16 = (entry_name.len() + 9).try_into().map_err(|_| {
                     Error::new(
                         ErrorKind::InvalidData,
@@ -244,12 +240,13 @@ impl<'a> Context<'a> {
                 })?;
                 let len = path.metadata()?.len();
                 if len > 0xFFFFFF {
-                    eprintln!(
-                        "Error: {} is larger than the maximum file size.",
-                        path.display()
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Error: {} is larger than the maximum file size.",
+                            path.display()
+                        ),
                     );
-
-                    exit(1);
                 }
                 println!("Adding {}...", path.display());
                 // Now safe to coerce len into u32
@@ -260,7 +257,7 @@ impl<'a> Context<'a> {
                 fentry[1..=2].clone_from_slice(&elen.to_le_bytes());
                 fentry[3..=4].clone_from_slice(&parent.to_le_bytes());
                 fentry[5] = 0xFF; // Flags
-                fentry[6..=8].clone_from_slice(&len.to_le_bytes()[0..=2]);
+                fentry[6..=8].clone_from_slice(&len.to_le_bytes()[0..=2]); // Note: len: u32
                 fentry[9] = (*section_id).to_le_bytes()[0];
                 fentry[10] = (*section_id).to_le_bytes()[1];
                 fentry[11..][..entry.file_name().len()].clone_from_slice(entry_name_bytes);
@@ -323,14 +320,14 @@ impl<'a> Context<'a> {
         }
         self.rom.flush()?;
 
-        let result = self.write_filesystem();
+        let result = self.write_filesystem()?;
         self.rom.flush()?;
         println!(
             "Filesystem successfully written to {}.",
             self.rom_path.display()
         );
         print!("Indexes of written data pages: ");
-        let [lo, hi] = result?.to_le_bytes();
+        let [lo, hi] = result.to_le_bytes();
         for i in 0..u32::from(lo) {
             print!("{:02x} ", u32::from(self.dat_start) + i)
         }
@@ -347,6 +344,15 @@ fn main() {
     let opt: Opt = Opt::from_args();
     match Context::new(&opt.input, &opt.model).and_then(|mut c| c.run()) {
         Ok(()) => exit(0),
-        Err(_) => exit(1),
+        Err(e) => match e.get_ref() {
+            Some(msg) => {
+                eprintln!("{}", msg);
+                exit(1);
+            }
+            None => {
+                eprintln!("{}", e);
+                exit(1);
+            }
+        },
     }
 }
