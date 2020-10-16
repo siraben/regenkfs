@@ -1,5 +1,4 @@
 #![allow(non_snake_case)]
-#![feature(seek_convenience)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::{
@@ -21,6 +20,8 @@ const KFS_FILE_ID: u8 = 0x7F;
 const KFS_DIR_ID: u8 = 0xBF;
 const KFS_SYM_ID: u8 = 0xDF;
 const KFS_VERSION: u8 = 0x0;
+
+const KFS_MAX_FILE_LEN: u64 = 0xFFFFFF;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "regenkfs")]
@@ -174,14 +175,23 @@ impl<'a> Context<'a> {
         fatptr: &mut u32,
     ) -> Result<(), Error> {
         let parent: u16 = *parent_id;
+
         // Put paths into a Vec to sort alphabetically.
-        let mut paths: Vec<DirEntry> = fs::read_dir(model)?.map(|r| r.unwrap()).collect();
+        let mut paths: Vec<DirEntry> = fs::read_dir(model)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         paths.sort_by_key(|dir| dir.path());
         for entry in paths {
             let path = entry.path();
             let entry_name: OsString = entry.file_name();
-            let entry_str: &str = entry_name.to_str().unwrap();
+            let entry_str: &str = entry_name.to_str().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Filename {} does not contain valid UTF-8.", path.display()),
+                )
+            })?;
             let entry_name_bytes: &[u8] = entry_str.as_bytes();
+
             if entry.file_type()?.is_symlink() {
                 let target = path.read_link()?;
                 println!(
@@ -193,11 +203,19 @@ impl<'a> Context<'a> {
                 // Use .to_str() instead of .file_name() to avoid
                 // losing relative path.
                 // (i.e. want ../foo.c instead of foo.c)
-                let target_name: &str = target.to_str().unwrap();
+                let target_name: &str = target.to_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Filename {} does not contain valid UTF-8.",
+                            target.display()
+                        ),
+                    )
+                })?;
                 let target_name_bytes: &[u8] = target_name.as_bytes();
 
-                let dl: u16 = entry_name_bytes.len().try_into().unwrap();
-                let tl: u16 = target_name_bytes.len().try_into().unwrap();
+                let dl: u16 = entry_name.len().try_into().unwrap();
+                let tl: u16 = target_name.len().try_into().unwrap();
 
                 let elen: u16 = dl + tl + 5;
                 let mut sentry: Vec<u8> = vec![0x0; usize::from(elen) + 3];
@@ -227,7 +245,7 @@ impl<'a> Context<'a> {
                 *parent_id += 1;
                 fentry[5..=6].clone_from_slice(&parent_id.to_le_bytes());
                 fentry[7] = 0xFF; // Flags
-                fentry[8..][..entry.file_name().len()].clone_from_slice(entry_name_bytes);
+                fentry[8..][..entry_name.len()].clone_from_slice(entry_name_bytes);
                 fentry.reverse();
                 self.write_fat(fentry, elen + 3, fatptr)?;
                 self.write_recursive(path, parent_id, section_id, fatptr)?
@@ -238,8 +256,8 @@ impl<'a> Context<'a> {
                         format!("Filename too long: {}", entry_str),
                     )
                 })?;
-                let len = path.metadata()?.len();
-                if len > 0xFFFFFF {
+                let len = entry.metadata()?.len();
+                if len > KFS_MAX_FILE_LEN {
                     Error::new(
                         ErrorKind::InvalidData,
                         format!(
@@ -258,8 +276,7 @@ impl<'a> Context<'a> {
                 fentry[3..=4].clone_from_slice(&parent.to_le_bytes());
                 fentry[5] = 0xFF; // Flags
                 fentry[6..=8].clone_from_slice(&len.to_le_bytes()[0..=2]); // Note: len: u32
-                fentry[9] = (*section_id).to_le_bytes()[0];
-                fentry[10] = (*section_id).to_le_bytes()[1];
+                fentry[9..=10].clone_from_slice(&(section_id.to_le_bytes()));
                 fentry[11..][..entry.file_name().len()].clone_from_slice(entry_name_bytes);
                 fentry.reverse();
                 self.write_fat(fentry, elen + 3, fatptr)?;
@@ -275,7 +292,7 @@ impl<'a> Context<'a> {
     // byte) written.
     fn write_filesystem(&mut self) -> Result<u16, Error> {
         let mut parent_id: u16 = 0;
-        let mut section_id: u16 = ((u16::from(self.dat_start)) << 8) | 1;
+        let mut section_id: u16 = (u16::from(self.dat_start) << 8) | 1;
         let mut fatptr: u32 = (u32::from(self.fat_start) + 1) * u32::from(PAGE_LENGTH);
         let fatptr_start: u32 = fatptr;
         /* Write the first DAT page's magic number */
@@ -314,7 +331,7 @@ impl<'a> Context<'a> {
         self.rom.seek(SeekFrom::Start(
             u64::from(self.dat_start) * u64::from(PAGE_LENGTH),
         ))?;
-        for p in self.dat_start..(self.fat_start + 1) {
+        for p in self.dat_start..=self.fat_start {
             blank_page[0] = if p <= self.fat_start - 4 { b'K' } else { 0xFF };
             self.rom.write_all(&blank_page)?;
         }
@@ -344,15 +361,9 @@ fn main() {
     let opt: Opt = Opt::from_args();
     match Context::new(&opt.input, &opt.model).and_then(|mut c| c.run()) {
         Ok(()) => exit(0),
-        Err(e) => match e.get_ref() {
-            Some(msg) => {
-                eprintln!("{}", msg);
-                exit(1);
-            }
-            None => {
-                eprintln!("{}", e);
-                exit(1);
-            }
-        },
+        Err(e) => {
+            eprintln!("{}", e.get_ref().unwrap_or(&e));
+            exit(1);
+        }
     }
 }
