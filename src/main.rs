@@ -75,8 +75,7 @@ impl<'a> Context<'a> {
             // C original has undefined behavior: context.fat_start = length / PAGE_LENGTH - 0x9;
             TryInto::<u8>::try_into(length / u64::from(PAGE_LENGTH))
                 .unwrap()
-                .overflowing_sub(9)
-                .0
+                .wrapping_sub(9)
         } else {
             // Safe version
             TryInto::<u8>::try_into(length / u64::from(PAGE_LENGTH) - 9)
@@ -99,8 +98,9 @@ impl<'a> Context<'a> {
     }
 
     fn write_block(&mut self, file: &mut BufReader<File>, section_id: u16) -> Result<(), Error> {
-        let flash_page: u16 = section_id >> 8;
-        let index: u16 = section_id & 0xFF;
+        let [l, h] = section_id.to_le_bytes();
+        let flash_page: u16 = u16::from(h);
+        let index: u16 = u16::from(l);
         self.rom.seek(SeekFrom::Start(
             u64::from(flash_page) * u64::from(PAGE_LENGTH)
                 + u64::from(index) * u64::from(BLOCK_SIZE),
@@ -122,8 +122,9 @@ impl<'a> Context<'a> {
         file.seek(SeekFrom::Start(0))?;
         while length > 0 {
             /* Prep */
-            let mut flash_page: u16 = *section_id >> 8;
-            let mut index: u8 = (*section_id & 0xFF).try_into().unwrap();
+            let [l, h] = (*section_id).to_le_bytes();
+            let mut flash_page: u16 = u16::from(h);
+            let mut index: u8 = l;
             let mut nSID: u16 = 0xFFFF;
             let header_addr: u32 =
                 u32::from(PAGE_LENGTH) * u32::from(flash_page) + u32::from(index) * 4;
@@ -156,11 +157,7 @@ impl<'a> Context<'a> {
             self.write_block(file, *section_id)?;
             self.rom.flush()?;
 
-            if length < u32::from(BLOCK_SIZE) {
-                length = 0;
-            } else {
-                length -= u32::from(BLOCK_SIZE);
-            }
+            length = length.saturating_sub(u32::from(BLOCK_SIZE));
             pSID = *section_id;
             *section_id = (flash_page << 8) | u16::from(index);
         }
@@ -192,8 +189,8 @@ impl<'a> Context<'a> {
                 let entry_name_bytes: &[u8] = entry_name.to_str().unwrap().as_bytes();
 
                 // Use .to_str() instead of .file_name() to avoid
-                // losing relative path (i.e. want ../foo.c
-                // instead of foo.c)
+                // losing relative path.
+                // (i.e. want ../foo.c instead of foo.c)
                 let target_name: &str = target.to_str().unwrap();
                 let target_name_bytes: &[u8] = target_name.as_bytes();
 
@@ -207,8 +204,8 @@ impl<'a> Context<'a> {
                 sentry[1..=2].clone_from_slice(&elen.to_le_bytes());
                 sentry[3..=4].clone_from_slice(&parent.to_le_bytes());
                 sentry[5] = (dl + 1).try_into().unwrap();
-                sentry[6..usize::from(6 + dl)].clone_from_slice(entry_name_bytes);
-                sentry[(usize::from(6 + dl + 1))..(usize::from(6 + dl + 1) + usize::from(tl))]
+                sentry[6..][..usize::from(dl)].clone_from_slice(entry_name_bytes);
+                sentry[usize::from(7 + dl)..][..usize::from(tl)]
                     .clone_from_slice(target_name_bytes);
                 sentry.reverse();
                 self.write_fat(sentry, elen + 3, fatptr)?
@@ -231,7 +228,7 @@ impl<'a> Context<'a> {
                 *parent_id += 1;
                 fentry[5..=6].clone_from_slice(&(*parent_id).to_le_bytes());
                 fentry[7] = 0xFF; // Flags
-                fentry[8..8 + entry.file_name().len()].clone_from_slice(entry_name_bytes);
+                fentry[8..][..entry.file_name().len()].clone_from_slice(entry_name_bytes);
                 fentry.reverse();
                 self.write_fat(fentry, elen + 3, fatptr)?;
                 self.write_recursive(path, parent_id, section_id, fatptr)?
@@ -266,7 +263,7 @@ impl<'a> Context<'a> {
                 fentry[6..=8].clone_from_slice(&len.to_le_bytes()[0..=2]);
                 fentry[9] = (*section_id).to_le_bytes()[0];
                 fentry[10] = (*section_id).to_le_bytes()[1];
-                fentry[11..11 + entry.file_name().len()].clone_from_slice(entry_name_bytes);
+                fentry[11..][..entry.file_name().len()].clone_from_slice(entry_name_bytes);
                 fentry.reverse();
                 self.write_fat(fentry, elen + 3, fatptr)?;
                 self.write_dat(&mut BufReader::new(File::open(path)?), len, section_id)?
@@ -308,14 +305,7 @@ impl<'a> Context<'a> {
         // sectionId's high byte is a page number
         result = if cfg!(feature = "c-undef") {
             // C original has undefined behavior:  result += (sectionId >> 8) - dat_start + 1;
-            result
-                .overflowing_add(
-                    (section_id >> 8)
-                        .overflowing_sub(u16::from(self.dat_start))
-                        .0,
-                )
-                .0
-                + 1
+            result.wrapping_add((section_id >> 8).wrapping_sub(u16::from(self.dat_start))) + 1
         } else {
             // Safe version
             result + (section_id >> 8) - u16::from(self.dat_start) + 1
