@@ -1,6 +1,6 @@
-# remkrom - reimplementation of genkfs in Rust
+# regenkfs - reimplementation of genkfs in Rust
 
-Writes individual files into a ROM image.  Works as a drop-in
+Writes a KFS filesystem into a ROM file.  Works as a drop-in
 replacement for [genkfs](https://github.com/KnightOS/genkfs/).  It has
 been tested and has the same behavior as the C version.
 
